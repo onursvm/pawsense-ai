@@ -2,16 +2,21 @@ import time
 import logging
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Dict, List
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .schemas import PredictionResponse, HealthResponse, ErrorResponse
 from .preprocessing import validate_and_preprocess_image
 from .model_service import model_service, BREED_DISPLAY_NAMES
+
+# Frontend static distribution path
+FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
 # Configure logging
 logging.basicConfig(
@@ -32,7 +37,6 @@ async def lifespan(app: FastAPI):
         logger.info("Model loaded and ready for predictions.")
     except Exception as e:
         logger.error(f"Failed to load ONNX model on startup: {e}")
-        # Let the app start so /health can report failure
     yield
     # Shutdown
     logger.info("Shutting down PawSense AI Backend.")
@@ -57,6 +61,11 @@ app.add_middleware(
 # Rate Limiter Middleware
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    # Don't rate limit static files (assets, favicon, samples)
+    path = request.url.path
+    if path.startswith("/assets") or path.startswith("/samples") or path.endswith((".ico", ".svg", ".png", ".jpg", ".css", ".js")):
+        return await call_next(request)
+
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
     window = 60.0  # 1 minute window
@@ -77,16 +86,7 @@ async def rate_limit_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
-@app.get("/", tags=["General"])
-async def root():
-    return {
-        "service": "PawSense AI API",
-        "status": "online",
-        "version": settings.PROJECT_VERSION,
-        "docs_url": "/docs",
-        "health_url": "/health"
-    }
-
+# API Endpoints
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     return HealthResponse(
@@ -197,3 +197,47 @@ async def predict_dog_breed(file: UploadFile = File(...)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="AI model inference failed to produce an output."
         )
+
+# Mount Static Files & SPA Fallback (Serves Frontend directly from FastAPI)
+if FRONTEND_DIST.exists():
+    logger.info(f"Frontend dist directory detected at {FRONTEND_DIST}. Mounting static assets.")
+    if (FRONTEND_DIST / "assets").exists():
+        app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+    if (FRONTEND_DIST / "samples").exists():
+        app.mount("/samples", StaticFiles(directory=str(FRONTEND_DIST / "samples")), name="samples")
+
+    @app.get("/")
+    async def serve_index():
+        index_file = FRONTEND_DIST / "index.html"
+        if index_file.is_file():
+            return FileResponse(str(index_file))
+        return {
+            "service": "PawSense AI API",
+            "status": "online",
+            "version": settings.PROJECT_VERSION
+        }
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):
+        # Exclude reserved API paths
+        if full_path in ["health", "classes", "predict", "docs", "redoc", "openapi.json"]:
+            raise HTTPException(status_code=404, detail="Not Found")
+        
+        target = FRONTEND_DIST / full_path
+        if target.is_file():
+            return FileResponse(str(target))
+
+        index_file = FRONTEND_DIST / "index.html"
+        if index_file.is_file():
+            return FileResponse(str(index_file))
+        raise HTTPException(status_code=404, detail="Resource Not Found")
+else:
+    @app.get("/", tags=["General"])
+    async def root():
+        return {
+            "service": "PawSense AI API",
+            "status": "online",
+            "version": settings.PROJECT_VERSION,
+            "docs_url": "/docs",
+            "health_url": "/health"
+        }
