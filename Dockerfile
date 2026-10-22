@@ -11,8 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY backend/requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend code and model weights
+# Copy backend code, model weights, and pre-built frontend
 COPY backend/ /app/backend/
+COPY frontend/dist/ /app/frontend/dist/
 
 ENV PYTHONPATH=/app
 ENV ENVIRONMENT=production
